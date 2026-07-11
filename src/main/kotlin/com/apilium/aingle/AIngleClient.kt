@@ -1,142 +1,239 @@
 package com.apilium.aingle
 
-import io.ktor.client.*
-import io.ktor.client.call.*
-import io.ktor.client.engine.cio.*
-import io.ktor.client.plugins.*
-import io.ktor.client.plugins.contentnegotiation.*
-import io.ktor.client.plugins.websocket.*
-import io.ktor.client.request.*
-import io.ktor.http.*
-import io.ktor.serialization.kotlinx.json.*
-import io.ktor.websocket.*
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.future.await
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.KSerializer
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.serializer
+import java.net.URI
+import java.net.URLEncoder
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.nio.charset.StandardCharsets
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.toJavaDuration
 
 /**
- * Configuration for AIngle client.
- */
-data class AIngleClientConfig(
-    /** Node URL */
-    val nodeUrl: String = "http://localhost:8080",
-    /** WebSocket URL */
-    val wsUrl: String = "ws://localhost:8081",
-    /** Request timeout */
-    val timeout: Duration = 30.seconds,
-    /** Enable debug logging */
-    val debug: Boolean = false
-)
-
-/**
- * AIngle Client for interacting with AIngle nodes.
+ * Client for the AIngle Cortex REST API, the verifiable memory cortex for AI
+ * agents. All methods are `suspend` functions and run the underlying HTTP call
+ * off the calling thread.
  *
  * Example:
  * ```kotlin
  * val client = AIngleClient()
- *
- * // Create an entry
- * val hash = client.createEntry(mapOf("sensor" to "temp", "value" to 23.5))
- *
- * // Retrieve an entry
- * val entry = client.getEntry(hash)
+ * val id = client.remember("note", data = JsonPrimitive("hello"))
+ * val hits = client.recall(text = "hello")
  * ```
+ *
+ * @param baseUrl base URL of the Cortex server. Defaults to `http://127.0.0.1:19090`.
+ * @param token optional bearer token, sent as `Authorization: Bearer <token>`.
+ * @param timeout per-request timeout. Defaults to 30 seconds.
  */
 class AIngleClient(
-    private val config: AIngleClientConfig = AIngleClientConfig()
-) : AutoCloseable {
+    baseUrl: String = "http://127.0.0.1:19090",
+    private val token: String? = null,
+    private val timeout: Duration = 30.seconds
+) {
+    private val base: String = baseUrl.trimEnd('/')
 
     private val json = Json {
         ignoreUnknownKeys = true
-        isLenient = true
+        encodeDefaults = true
+        explicitNulls = false
     }
 
-    private val httpClient = HttpClient(CIO) {
-        install(ContentNegotiation) {
-            json(json)
+    private val http: HttpClient = HttpClient.newBuilder()
+        .connectTimeout(timeout.toJavaDuration())
+        .build()
+
+    // -----------------------------------------------------------------------
+    // Health & stats
+    // -----------------------------------------------------------------------
+
+    suspend fun health(): Health = get("/api/v1/health")
+
+    suspend fun stats(): Stats = get("/api/v1/stats")
+
+    // -----------------------------------------------------------------------
+    // Memory
+    // -----------------------------------------------------------------------
+
+    suspend fun remember(
+        entryType: String,
+        data: JsonElement,
+        tags: List<String> = emptyList(),
+        importance: Double = 0.0,
+        embedding: List<Double>? = null
+    ): RememberResponse = post(
+        "/api/v1/memory/remember",
+        RememberRequest(entryType, data, tags, importance, embedding)
+    )
+
+    suspend fun recall(
+        text: String? = null,
+        tags: List<String> = emptyList(),
+        entryType: String? = null,
+        minImportance: Double? = null,
+        limit: Int? = null
+    ): List<RecallResult> = post(
+        "/api/v1/memory/recall",
+        RecallRequest(text, tags, entryType, minImportance, limit)
+    )
+
+    suspend fun search(
+        embedding: List<Double>,
+        k: Int,
+        minSimilarity: Double = 0.0,
+        entryType: String? = null,
+        tags: List<String>? = null
+    ): List<RecallResult> = post(
+        "/api/v1/memory/search",
+        VectorSearchRequest(embedding, k, minSimilarity, entryType, tags)
+    )
+
+    suspend fun memoryStats(): MemoryStats = get("/api/v1/memory/stats")
+
+    suspend fun forget(id: String) {
+        delete("/api/v1/memory/${encode(id)}")
+    }
+
+    // -----------------------------------------------------------------------
+    // Triples
+    // -----------------------------------------------------------------------
+
+    suspend fun createTriple(subject: String, predicate: String, `object`: Value): Triple = post(
+        "/api/v1/triples",
+        CreateTripleRequest(subject, predicate, `object`)
+    )
+
+    suspend fun listTriples(
+        subject: String? = null,
+        predicate: String? = null,
+        `object`: String? = null,
+        limit: Int? = null,
+        offset: Int? = null
+    ): ListTriplesResponse {
+        val query = buildQuery(
+            "subject" to subject,
+            "predicate" to predicate,
+            "object" to `object`,
+            "limit" to limit?.toString(),
+            "offset" to offset?.toString()
+        )
+        return get("/api/v1/triples$query")
+    }
+
+    suspend fun getTriple(id: String): Triple = get("/api/v1/triples/${encode(id)}")
+
+    suspend fun deleteTriple(id: String) {
+        delete("/api/v1/triples/${encode(id)}")
+    }
+
+    suspend fun createTriples(triples: List<CreateTripleRequest>): BatchCreateResponse = post(
+        "/api/v1/triples/batch",
+        BatchCreateRequest(triples)
+    )
+
+    // -----------------------------------------------------------------------
+    // Query
+    // -----------------------------------------------------------------------
+
+    suspend fun query(
+        subject: String? = null,
+        predicate: String? = null,
+        `object`: Value? = null,
+        limit: Int? = null
+    ): QueryResponse = post(
+        "/api/v1/query",
+        QueryRequest(subject, predicate, `object`, limit)
+    )
+
+    suspend fun subjects(predicate: String? = null, limit: Int? = null): SubjectsResponse {
+        val query = buildQuery("predicate" to predicate, "limit" to limit?.toString())
+        return get("/api/v1/query/subjects$query")
+    }
+
+    suspend fun predicates(subject: String? = null, limit: Int? = null): PredicatesResponse {
+        val query = buildQuery("subject" to subject, "limit" to limit?.toString())
+        return get("/api/v1/query/predicates$query")
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP plumbing
+    // -----------------------------------------------------------------------
+
+    private suspend inline fun <reified T> get(path: String): T =
+        send(newRequest(path).GET().build(), serializer())
+
+    private suspend inline fun <reified B, reified T> post(path: String, body: B): T {
+        val payload = json.encodeToString(serializer<B>(), body)
+        val request = newRequest(path)
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
+            .build()
+        return send(request, serializer<T>())
+    }
+
+    private suspend fun delete(path: String) {
+        val request = newRequest(path).DELETE().build()
+        sendRaw(request)
+    }
+
+    private fun newRequest(path: String): HttpRequest.Builder {
+        val builder = HttpRequest.newBuilder()
+            .uri(URI.create("$base$path"))
+            .timeout(timeout.toJavaDuration())
+            .header("Accept", "application/json")
+        if (token != null) {
+            builder.header("Authorization", "Bearer $token")
         }
-        install(HttpTimeout) {
-            requestTimeoutMillis = config.timeout.inWholeMilliseconds
-        }
-        install(WebSockets)
+        return builder
     }
 
-    /**
-     * Create a new entry in the DAG.
-     *
-     * @param data Entry payload
-     * @return Hash of the created entry
-     */
-    suspend fun createEntry(data: Any): EntryHash {
-        val response = httpClient.post("${config.nodeUrl}/api/v1/entries") {
-            contentType(ContentType.Application.Json)
-            setBody(mapOf("data" to data))
-        }
-
-        val result: CreateEntryResponse = response.body()
-        return result.hash
-    }
-
-    /**
-     * Retrieve an entry by hash.
-     *
-     * @param hash Entry hash
-     * @return Entry if found, null otherwise
-     */
-    suspend fun getEntry(hash: EntryHash): Entry? {
-        val response = httpClient.get("${config.nodeUrl}/api/v1/entries/$hash")
-
-        return when (response.status) {
-            HttpStatusCode.NotFound -> null
-            HttpStatusCode.OK -> response.body()
-            else -> throw AIngleException(
-                ErrorCode.NETWORK_ERROR,
-                "Unexpected status: ${response.status}"
-            )
+    private suspend fun <T> send(request: HttpRequest, deserializer: KSerializer<T>): T {
+        val response = sendRaw(request)
+        val body = response.body()
+        return if (body.isBlank()) {
+            json.decodeFromString(deserializer, "null")
+        } else {
+            json.decodeFromString(deserializer, body)
         }
     }
 
-    /**
-     * Get node information.
-     *
-     * @return Node information
-     */
-    suspend fun getNodeInfo(): NodeInfo {
-        val response = httpClient.get("${config.nodeUrl}/api/v1/info")
-        return response.body()
+    private suspend fun sendRaw(request: HttpRequest): HttpResponse<String> {
+        val response = withContext(Dispatchers.IO) {
+            http.sendAsync(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
+                .await()
+        }
+        val status = response.statusCode()
+        if (status !in 200..299) {
+            throw AIngleException(status, extractError(response.body(), status))
+        }
+        return response
     }
 
-    /**
-     * Subscribe to real-time updates.
-     *
-     * @return Flow of entries
-     */
-    fun subscribe(): Flow<Entry> = flow {
-        httpClient.webSocket(config.wsUrl) {
-            while (isActive) {
-                when (val frame = incoming.receive()) {
-                    is Frame.Text -> {
-                        val text = frame.readText()
-                        val entry = json.decodeFromString<Entry>(text)
-                        emit(entry)
-                    }
-                    else -> {}
-                }
-            }
+    private fun extractError(body: String, status: Int): String {
+        if (body.isBlank()) return "HTTP $status"
+        return try {
+            val parsed = json.decodeFromString(ErrorBody.serializer(), body)
+            parsed.message ?: parsed.error ?: body
+        } catch (_: Exception) {
+            body
         }
     }
 
-    /**
-     * Close the client.
-     */
-    override fun close() {
-        httpClient.close()
+    private fun encode(value: String): String =
+        URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20")
+
+    private fun buildQuery(vararg params: Pair<String, String?>): String {
+        val parts = params.mapNotNull { (key, value) ->
+            value?.let { "${encode(key)}=${encode(it)}" }
+        }
+        return if (parts.isEmpty()) "" else "?" + parts.joinToString("&")
     }
 }
-
-@kotlinx.serialization.Serializable
-private data class CreateEntryResponse(val hash: EntryHash)
