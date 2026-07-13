@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.apilium"
-version = "0.1.0"
+version = "0.2.0"
 
 repositories {
     mavenCentral()
@@ -17,23 +17,18 @@ dependencies {
     // Kotlin
     implementation(kotlin("stdlib"))
 
-    // Coroutines
+    // Coroutines (core + JDK8/CompletableFuture integration for HttpClient.sendAsync)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-jdk8:1.8.0")
 
     // Serialization
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
 
-    // HTTP Client
-    implementation("io.ktor:ktor-client-core:2.3.8")
-    implementation("io.ktor:ktor-client-cio:2.3.8")
-    implementation("io.ktor:ktor-client-content-negotiation:2.3.8")
-    implementation("io.ktor:ktor-serialization-kotlinx-json:2.3.8")
-    implementation("io.ktor:ktor-client-websockets:2.3.8")
+    // HTTP transport is the JDK 11+ java.net.http.HttpClient (no extra dependency).
 
     // Testing
     testImplementation(kotlin("test"))
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.0")
-    testImplementation("io.ktor:ktor-client-mock:2.3.8")
 }
 
 tasks.test {
@@ -56,7 +51,7 @@ publishing {
 
             pom {
                 name.set("AIngle SDK for Kotlin")
-                description.set("Official Kotlin SDK for AIngle - the ultra-light distributed ledger for IoT devices")
+                description.set("Official Kotlin SDK for AIngle, the verifiable memory cortex for AI agents.")
                 url.set("https://github.com/ApiliumCode/aingle-sdk-kotlin")
 
                 licenses {
